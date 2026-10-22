@@ -5,10 +5,36 @@
  * The id is assigned while kramdown parses, in
  * `kramdown-parser-gfm`'s `generate_gfm_header_id`. Just the Docs only copies
  * that id onto the heading permalink. This module reproduces the id.
+ *
+ * One heading moves through the file in this order:
+ *
+ * 1. `splitFrontMatter` lifts off a leading `---` block. `splitFencedBlocks`
+ *    then marks fenced regions. `#` in either place is not a heading, but
+ *    those lines still count so `line` stays pointed at the source.
+ * 2. `headingContents` reads each remaining ATX line, drops a closing run
+ *    of `#`, and peels a trailing `{#custom-id}` when one is present.
+ * 3. A generated id starts in `headingIdText`. Code spans stay literal.
+ *    Images are removed, links keep their label, HTML tags come off, and
+ *    underscore emphasis is unwrapped. `---`, `--`, `<< `, and ` >>` are
+ *    turned into the characters kramdown inserts before it filters.
+ * 4. `gfmAnchor` lowercases that string, keeps letters, marks, numbers,
+ *    connector punctuation, spaces, tabs, and hyphens, drops the rest, and
+ *    turns the spaces and tabs into `-`.
+ * 5. `headingAnchors` uses that base as-is the first time. The next copy
+ *    gets `-1`, then `-2`. An explicit `{#id}` is stored unchanged and does
+ *    not take a number. `autoIdPrefix` is added only to generated ids.
+ *
+ * Finding a heading again is a separate path. `fold` flattens case and
+ * quotes, `indexHeadings` stores the first match under both the raw
+ * contents and the visible text, and `findHeading` tries the query, that
+ * visible form, and the text after a final `#`.
  */
 
+// Letters, marks, numbers, and connector punctuation (underscore). Asterisks,
+// periods, apostrophes, and similar marks fail this test and disappear later.
 const WORD = /[\p{L}\p{M}\p{N}\p{Pc}]/u;
 
+// Longer sequences are listed first. `---` must win over `--`.
 const TYPOGRAPHIC = [
   ["---", "\u2014"],
   ["--", "\u2013"],
@@ -19,6 +45,8 @@ const TYPOGRAPHIC = [
 const IMAGE = /!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])/g;
 const LINK = /\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g;
 const HTML_TAG = /<\/?[A-Za-z][^>]*>/g;
+// Underscore is a word character, so these wrappers have to come off before
+// the character filter. `*` and `~` are dropped by the filter on their own.
 const BOLD_UNDER = /__([^_]+?)__/;
 const ITALIC_UNDER = /(?<![\p{L}\p{N}_])_([^_\s][^_]*?)_(?![\p{L}\p{N}_])/u;
 const HEADER_ID = /[ \t]\{#([A-Za-z_:][\w:.-]*)\}[ \t]*$/;
@@ -29,7 +57,11 @@ function isWordChar(char) {
   return WORD.test(char);
 }
 
-/** Character filter from `generate_gfm_header_id`, without the duplicate suffix. */
+/**
+ * Step 4. Character filter from `generate_gfm_header_id`, with no duplicate
+ * suffix yet. "5C. Pat's Desk" becomes "5c-pats-desk": the period and
+ * apostrophe drop out, and the spaces become hyphens.
+ */
 export function gfmAnchor(text) {
   let kept = "";
   for (const char of text.toLowerCase()) {
@@ -40,6 +72,9 @@ export function gfmAnchor(text) {
   return kept.replaceAll(" ", "-").replaceAll("\t", "-");
 }
 
+// Step 3, last. Run before the filter so an em dash or en dash is discarded
+// instead of leaving the hyphens that spelled it. "foo---bar" becomes
+// "foobar"; "foo --- bar" keeps the two spaces and becomes "foo--bar".
 function applyTypography(text) {
   let index = 0;
   let result = "";
@@ -61,6 +96,7 @@ function applyTypography(text) {
   return result;
 }
 
+// One pair per replacement, so nested or neighboring pairs need another pass.
 function stripEmphasis(text) {
   let previous;
   while (previous !== text) {
@@ -70,6 +106,8 @@ function stripEmphasis(text) {
   return text;
 }
 
+// Step 3, first. A closed run of backticks is code and is not rewritten.
+// An escaped or unclosed backtick stays in the prose half.
 function splitCodeSpans(text) {
   const parts = [];
   let buffer = "";
@@ -100,6 +138,9 @@ function splitCodeSpans(text) {
   return parts;
 }
 
+// Step 3. Code is copied through, which is why "`---`" keeps three hyphens.
+// Prose loses images, keeps link labels, drops tags, unwraps `_emphasis_`,
+// and then optionally receives the typographic substitutions.
 function reduceInline(raw, { typography }) {
   let result = "";
   for (const [isCode, content] of splitCodeSpans(raw)) {
@@ -114,12 +155,12 @@ function reduceInline(raw, { typography }) {
   return result;
 }
 
-/** Heading text kramdown stores before building the id. */
+/** Heading contents reduced to the string kramdown hashes. */
 export function headingIdText(raw) {
   return reduceInline(raw, { typography: true });
 }
 
-/** Visible heading text, used as a link label when a wiki link has no alias. */
+/** Visible heading text, for a link label. Typography stays as typed. */
 export function headingPlainText(raw) {
   return reduceInline(raw, { typography: false }).trim();
 }
@@ -132,6 +173,8 @@ export function anchorForHeadingText(text, { autoIdPrefix = "" } = {}) {
   return autoIdPrefix + gfmAnchor(headingIdText(text));
 }
 
+// Step 2. `## Title ## {#custom}` yields text "Title" and explicitId "custom".
+// A line that is only hashes, or whose text was only the id, is not a heading.
 function headingContents(line) {
   const stripped = line.replace(/\r?\n$/, "");
   const match = ATX.exec(stripped);
@@ -152,6 +195,7 @@ function countNewlines(text) {
   return text.match(/\n/g)?.length ?? 0;
 }
 
+// Keep the newline on each line so the caller can advance the line counter.
 function splitLinesKeep(text) {
   const lines = [];
   let start = 0;
@@ -165,6 +209,8 @@ function splitLinesKeep(text) {
   return lines;
 }
 
+// Step 1, fences. The closing fence must repeat the same character at least
+// as many times. A fence that never closes runs to the end of the chunk.
 function splitFencedBlocks(text) {
   const chunks = [];
   let buffer = "";
@@ -202,7 +248,11 @@ function splitFencedBlocks(text) {
   return chunks;
 }
 
-/** Split a leading YAML front matter block off a Markdown string. */
+/**
+ * Step 1, front matter. A document that opens with `---` returns that block
+ * separately. Anything else, including a `---` that never closes, stays in
+ * `body` so its headings are still read.
+ */
 export function splitFrontMatter(text) {
   const newline = text.startsWith("---\r\n") ? "\r\n" : text.startsWith("---\n") ? "\n" : null;
   if (!newline) return { front: "", body: text };
@@ -217,6 +267,8 @@ export function splitFrontMatter(text) {
   return { front: text.slice(0, end), body: text.slice(end) };
 }
 
+// Lookup only. NFC, case, curly quotes, and repeated spaces are flattened
+// so a typed target can meet the heading it names.
 function fold(text) {
   let folded = text.normalize("NFC").trim().toLowerCase();
   folded = folded
@@ -229,10 +281,8 @@ function fold(text) {
 }
 
 /**
- * ATX headings outside fenced code and front matter, in document order.
- * Each entry is `{ text, anchor, line, explicit }`.
- * Repeated generated ids get `-1`, `-2`, matching kramdown's counter.
- * An explicit `{#id}` is kept as written and does not advance that counter.
+ * Steps 1, 2, and 5. ATX headings outside fenced code and front matter, in
+ * document order. Each entry is `{ text, anchor, line, explicit }`.
  */
 export function headingAnchors(markdown, { autoIdPrefix = "" } = {}) {
   const { front, body } = splitFrontMatter(markdown);
@@ -250,6 +300,8 @@ export function headingAnchors(markdown, { autoIdPrefix = "" } = {}) {
     }
   }
 
+  // The map starts each base at -1, so the first sighting lands on 0 and
+  // keeps the bare id. Explicit ids are returned before that update.
   const seen = new Map();
   return found.map((heading) => {
     if (heading.explicitId) {
@@ -273,7 +325,7 @@ export function headingAnchors(markdown, { autoIdPrefix = "" } = {}) {
   });
 }
 
-/** Map folded heading text to the first heading with that text. */
+/** First heading for each folded form of its raw text and its visible text. */
 export function indexHeadings(headings) {
   const index = new Map();
   for (const heading of headings) {
@@ -284,7 +336,10 @@ export function indexHeadings(headings) {
   return index;
 }
 
-/** First heading whose text matches an Obsidian heading target. */
+/**
+ * First heading that matches an Obsidian-style target. The query is tried
+ * as written, then as visible text, then as the slice after its last `#`.
+ */
 export function findHeading(index, heading) {
   const candidates = [fold(heading)];
   const plain = fold(headingPlainText(heading));
